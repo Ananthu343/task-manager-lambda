@@ -45,11 +45,11 @@ export const handler = async (event) => {
             );
 
             // 5. Notify the main server to emit Socket.io event
-            await fetch(`${process.env.MAIN_SERVER_URL}/api/v1/internal/notify-report`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_SECRET },
-                body: JSON.stringify({ tenantId, reportId, s3Url })
-            });
+            // await fetch(`${process.env.MAIN_SERVER_URL}/api/v1/internal/notify-report`, {
+            //     method: 'POST',
+            //     headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_SECRET },
+            //     body: JSON.stringify({ tenantId, reportId, s3Url })
+            // });
         }
     } catch (err) {
         console.error("Lambda Error:", err);
