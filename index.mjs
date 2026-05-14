@@ -1,18 +1,28 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { Signer } from "@aws-sdk/rds-signer";
 import pkg from 'pg';
-const { Client } = pkg;
+const { Pool } = pkg;
 
-const s3Client = new S3Client({});
+// 1. Initialize Clients outside the handler for connection pooling (Performance)
+const region = process.env.AWS_REGION;
+const s3Client = new S3Client({ region });
+
+// Create the pool once. Lambda will reuse this pool across warm invocations.
+const pool = new Pool({
+  host: process.env.DB_HOST, // Get this from the 'Endpoints' tab
+  port: 5432,
+  database: process.env.DB_NAME, // Or your specific DB name
+  user: process.env.DB_USER,     // Your master username
+  password: process.env.DB_PASSWORD, 
+  ssl: { rejectUnauthorized: false }, // REQUIRED for RDS
+  connectionTimeoutMillis: 5000,
+});
 
 export const handler = async (event) => {
-    const client = new Client({
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }
-    });
+    // We use a pool client for this specific execution
+    const client = await pool.connect();
 
     try {
-        await client.connect();
-
         for (const record of event.Records) {
             const { reportId, tenantId, dummyCount } = JSON.parse(record.body);
 
@@ -36,7 +46,7 @@ export const handler = async (event) => {
                 ContentType: "text/csv"
             }));
 
-            const s3Url = `https://${bucketName}.s3.amazonaws.com/${fileName}`;
+            const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
 
             // 4. Update DB to 'completed'
             await client.query(
@@ -44,16 +54,13 @@ export const handler = async (event) => {
                 ['completed', s3Url, reportId]
             );
 
-            // 5. Notify the main server to emit Socket.io event
-            // await fetch(`${process.env.MAIN_SERVER_URL}/api/v1/internal/notify-report`, {
-            //     method: 'POST',
-            //     headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_SECRET },
-            //     body: JSON.stringify({ tenantId, reportId, s3Url })
-            // });
+            console.log(`Report ${reportId} processed successfully.`);
         }
     } catch (err) {
         console.error("Lambda Error:", err);
+        throw err; // Trigger SQS retry logic
     } finally {
-        await client.end();
+        // IMPORTANT: Release the client back to the pool, do NOT end the pool
+        client.release();
     }
 };
