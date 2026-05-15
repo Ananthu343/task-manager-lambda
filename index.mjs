@@ -4,11 +4,20 @@ dotenv.config();
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Signer } from "@aws-sdk/rds-signer";
 import pkg from 'pg';
+import { io } from 'socket.io-client';
+
 const { Pool } = pkg;
 
 // 1. Initialize Clients outside the handler for connection pooling (Performance)
 const region = process.env.AWS_REGION;
 const s3Client = new S3Client({ region });
+
+// Connect to your backend's Socket.io server
+// You must define BACKEND_SOCKET_URL in your Lambda's environment variables (e.g., https://api.yourdomain.com)
+const socket = io(process.env.BACKEND_SOCKET_URL, {
+    transports: ['websocket'],
+    autoConnect: true
+});
 
 // Create the pool once. Lambda will reuse this pool across warm invocations.
 const pool = new Pool({
@@ -58,15 +67,31 @@ export const handler = async (event) => {
             // 1. Update Status to 'processing'
             await client.query('UPDATE report_history SET status = $1 WHERE id = $2', ['processing', reportId]);
 
+            // ** EMIT: Initial progress **
+            socket.emit('download_progress', { reportId, tenantId, progress: 10 });
+
             // 2. Generate Dummy CSV Data
             let csvContent = "TaskID,Title,Status,Priority,CreatedAt\n";
+            
+            // To simulate dynamic progress, emit events at intervals
+            const batchSize = Math.max(1, Math.floor(dummyCount / 5)); // 5 checkpoints
+            
             for (let i = 0; i < dummyCount; i++) {
                 csvContent += `${Math.floor(Math.random() * 1000)},Dummy Task ${i},completed,low,${new Date().toISOString()}\n`;
+                
+                if ((i + 1) % batchSize === 0) {
+                    // Calculate progress logically up to 80%
+                    const progressPercent = 10 + Math.floor(((i + 1) / dummyCount) * 70); 
+                    socket.emit('download_progress', { reportId, tenantId, progress: progressPercent });
+                }
             }
+            
+            // Data generation complete
+            socket.emit('download_progress', { reportId, tenantId, progress: 85 });
 
             // 3. Upload to S3
             const bucketName = process.env.S3_BUCKET_NAME;
-            const fileName = `reports/${tenantId}/${reportId}.csv`;
+            const fileName = `reports/${tenantId}/Dummy_report_${reportId.slice(5)}.csv`;
             
             await s3Client.send(new PutObjectCommand({
                 Bucket: bucketName,
@@ -74,6 +99,9 @@ export const handler = async (event) => {
                 Body: csvContent,
                 ContentType: "text/csv"
             }));
+
+            // Upload complete
+            socket.emit('download_progress', { reportId, tenantId, progress: 95 });
 
             const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
 
@@ -83,8 +111,15 @@ export const handler = async (event) => {
                 ['completed', s3Url, reportId]
             );
 
+            // ** EMIT: Final Completion with link **
+            socket.emit('report_completed', { reportId, tenantId, link: s3Url });
+
             console.log(`Report ${reportId} processed successfully.`);
         }
+        
+        // Delay slightly to ensure Socket.io flushes all network events before Lambda freezes
+        await new Promise(resolve => setTimeout(resolve, 500)); 
+        
     } catch (err) {
         console.error("Lambda Error:", err);
         throw err; // Trigger SQS retry logic
