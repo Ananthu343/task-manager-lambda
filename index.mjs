@@ -19,6 +19,39 @@ const socket = io(process.env.BACKEND_SOCKET_URL, {
     autoConnect: true
 });
 
+// Socket Event Monitoring
+socket.on('connect', () => {
+    console.log('[SOCKET] Connected to backend:', socket.id);
+});
+
+socket.on('disconnect', (reason) => {
+    console.log('[SOCKET] Disconnected from backend. Reason:', reason);
+});
+
+socket.on('connect_error', (error) => {
+    console.error('[SOCKET] Connection error:', error.message);
+});
+
+socket.on('error', (error) => {
+    console.error('[SOCKET] Socket error:', error);
+});
+
+socket.on('reconnect', (attemptNumber) => {
+    console.log('[SOCKET] Reconnected after', attemptNumber, 'attempts');
+});
+
+socket.on('reconnect_attempt', (attemptNumber) => {
+    console.log('[SOCKET] Reconnection attempt #', attemptNumber);
+});
+
+socket.on('reconnect_error', (error) => {
+    console.error('[SOCKET] Reconnection error:', error.message);
+});
+
+socket.on('reconnect_failed', () => {
+    console.error('[SOCKET] Reconnection failed after max attempts');
+});
+
 // Create the pool once. Lambda will reuse this pool across warm invocations.
 const pool = new Pool({
   host: process.env.DB_HOST, // Get this from the 'Endpoints' tab
@@ -68,6 +101,7 @@ export const handler = async (event) => {
             await client.query('UPDATE report_history SET status = $1 WHERE id = $2', ['processing', reportId]);
 
             // ** EMIT: Initial progress **
+            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 10%`);
             socket.emit('download_progress', { reportId, tenantId, progress: 10 });
 
             // 2. Generate Dummy CSV Data
@@ -82,11 +116,13 @@ export const handler = async (event) => {
                 if ((i + 1) % batchSize === 0) {
                     // Calculate progress logically up to 80%
                     const progressPercent = 10 + Math.floor(((i + 1) / dummyCount) * 70); 
+                    console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: ${progressPercent}%`);
                     socket.emit('download_progress', { reportId, tenantId, progress: progressPercent });
                 }
             }
             
             // Data generation complete
+            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 85%`);
             socket.emit('download_progress', { reportId, tenantId, progress: 85 });
 
             // 3. Upload to S3
@@ -101,6 +137,7 @@ export const handler = async (event) => {
             }));
 
             // Upload complete
+            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 95%`);
             socket.emit('download_progress', { reportId, tenantId, progress: 95 });
 
             const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
@@ -112,6 +149,7 @@ export const handler = async (event) => {
             );
 
             // ** EMIT: Final Completion with link **
+            console.log(`[EMIT] report_completed - Report: ${reportId}, Tenant: ${tenantId}, URL: ${s3Url}`);
             socket.emit('report_completed', { reportId, tenantId, link: s3Url });
 
             console.log(`Report ${reportId} processed successfully.`);
