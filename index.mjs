@@ -14,6 +14,7 @@ const s3Client = new S3Client({ region });
 // Connect to your backend's Socket.io server
 // You must define BACKEND_SOCKET_URL in your Lambda's environment variables (e.g., https://api.yourdomain.com)
 const socket = io(process.env.BACKEND_SOCKET_URL || "http://localhost:4000", {
+    path: '/socket',
     transports: ['websocket'],
     autoConnect: true
 });
