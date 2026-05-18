@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { Worker } from 'worker_threads';
 import pkg from 'pg';
 import { io } from 'socket.io-client';
 
@@ -67,17 +68,18 @@ const pool = new Pool({
 // Retry logic with exponential backoff
 const connectWithRetry = async (maxRetries = 3, baseDelay = 500) => {
   let lastError;
-  
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`DB connection attempt ${attempt}/${maxRetries}`);
       const client = await pool.connect();
+      client.release();
       console.log("DB connection successful");
-      return client;
+      return;
     } catch (error) {
       lastError = error;
       console.warn(`DB connection failed (attempt ${attempt}): ${error.message}`);
-      
+
       if (attempt < maxRetries) {
         const delayMs = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
         console.log(`Retrying in ${delayMs}ms...`);
@@ -85,84 +87,138 @@ const connectWithRetry = async (maxRetries = 3, baseDelay = 500) => {
       }
     }
   }
-  
+
   throw new Error(`Failed to connect to database after ${maxRetries} attempts: ${lastError.message}`);
 };
 
-export const handler = async (event) => {
-    // We use a pool client for this specific execution with retry logic
-    const client = await connectWithRetry();
+const updateReportProgress = async (reportId, status, progress) => {
+  const query = `
+    UPDATE report_history
+    SET status = $1,
+        progress = $2
+    WHERE id = $3
+  `;
 
-    try {
-        for (const record of event.Records) {
-            const { reportId, tenantId, dummyCount } = JSON.parse(record.body);
+  await pool.query(query, [status, progress, reportId]);
+};
 
-            // 1. Update Status to 'processing'
-            await client.query('UPDATE report_history SET status = $1 WHERE id = $2', ['processing', reportId]);
+const LARGE_DUMMY_THRESHOLD = 50000;
 
-            // ** EMIT: Initial progress **
-            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 10%`);
-            socket.emit('download_progress', { reportId, tenantId, progress: 10 });
+const generateCsvInWorker = (reportId, dummyCount, emitProgress) => {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./generateCsvWorker.mjs', import.meta.url), {
+      workerData: { reportId, dummyCount }
+    });
 
-            // 2. Generate Dummy CSV Data
-            let csvContent = "TaskID,Title,Status,Priority,CreatedAt\n";
-            
-            // To simulate dynamic progress, emit events at intervals
-            const batchSize = Math.max(1, Math.floor(dummyCount / 5)); // 5 checkpoints
-            
-            for (let i = 0; i < dummyCount; i++) {
-                csvContent += `${Math.floor(Math.random() * 1000)},Dummy Task ${i},completed,low,${new Date().toISOString()}\n`;
-                
-                if ((i + 1) % batchSize === 0) {
-                    // Calculate progress logically up to 80%
-                    const progressPercent = 10 + Math.floor(((i + 1) / dummyCount) * 70); 
-                    console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: ${progressPercent}%`);
-                    socket.emit('download_progress', { reportId, tenantId, progress: progressPercent });
-                }
-            }
-            
-            // Data generation complete
-            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 85%`);
-            socket.emit('download_progress', { reportId, tenantId, progress: 85 });
+    const progressPromises = [];
+    let csvContent = '';
+    let resolved = false;
 
-            // 3. Upload to S3
-            const bucketName = process.env.S3_BUCKET_NAME;
-            const fileName = `reports/${tenantId}/Dummy_report_${reportId.slice(5)}.csv`;
-            
-            await s3Client.send(new PutObjectCommand({
-                Bucket: bucketName,
-                Key: fileName,
-                Body: csvContent,
-                ContentType: "text/csv"
-            }));
+    worker.on('message', (message) => {
+      if (message.type === 'progress') {
+        progressPromises.push(emitProgress(message.progress));
+        return;
+      }
 
-            // Upload complete
-            console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 95%`);
-            socket.emit('download_progress', { reportId, tenantId, progress: 95 });
+      if (message.type === 'done') {
+        csvContent = message.csvContent;
+        Promise.all(progressPromises)
+          .then(() => {
+            resolved = true;
+            resolve(csvContent);
+          })
+          .catch(reject);
+      }
+    });
 
-            const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
+    worker.on('error', (error) => {
+      if (!resolved) reject(error);
+    });
 
-            // 4. Update DB to 'completed'
-            await client.query(
-                'UPDATE report_history SET status = $1, link = $2 WHERE id = $3',
-                ['completed', s3Url, reportId]
-            );
+    worker.on('exit', (code) => {
+      if (code !== 0 && !resolved) {
+        reject(new Error(`Worker exited with code ${code}`));
+      }
+    });
+  });
+};
 
-            // ** EMIT: Final Completion with link **
-            console.log(`[EMIT] report_completed - Report: ${reportId}, Tenant: ${tenantId}, URL: ${s3Url}`);
-            socket.emit('report_completed', { reportId, tenantId, link: s3Url });
+const processRecord = async (record) => {
+  const { reportId, tenantId, dummyCount } = JSON.parse(record.body);
+  const bucketName = process.env.S3_BUCKET_NAME;
+  const fileName = `reports/${tenantId}/Dummy_report_${reportId.slice(5)}.csv`;
 
-            console.log(`Report ${reportId} processed successfully.`);
-        }
-        
-        // Delay slightly to ensure Socket.io flushes all network events before Lambda freezes
-        await new Promise(resolve => setTimeout(resolve, 500)); 
-        
-    } catch (err) {
-        console.error("Lambda Error:", err);
-        throw err; // Trigger SQS retry logic
-    } finally {
-        // IMPORTANT: Release the client back to the pool, do NOT end the pool
-        client.release();
+  const emitProgress = async (progress) => {
+    console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: ${progress}%`);
+    socket.emit('download_progress', { reportId, tenantId, progress });
+    await updateReportProgress(reportId, 'processing', progress);
+  };
+
+  let csvContent = "TaskID,Title,Status,Priority,CreatedAt\n";
+  await emitProgress(10);
+
+  if (dummyCount > LARGE_DUMMY_THRESHOLD) {
+    csvContent = await generateCsvInWorker(reportId, dummyCount, emitProgress);
+  } else {
+    const batchSize = Math.max(1, Math.floor(dummyCount / 5));
+    for (let i = 0; i < dummyCount; i++) {
+      csvContent += `${Math.floor(Math.random() * 1000)},Dummy Task ${i},completed,low,${new Date().toISOString()}\n`;
+
+      if ((i + 1) % batchSize === 0 || i === dummyCount - 1) {
+        const progressPercent = 10 + Math.floor(((i + 1) / dummyCount) * 70);
+        await emitProgress(progressPercent);
+      }
     }
+  }
+
+  console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 85%`);
+  socket.emit('download_progress', { reportId, tenantId, progress: 85 });
+  await updateReportProgress(reportId, 'processing', 85);
+
+  await s3Client.send(new PutObjectCommand({
+    Bucket: bucketName,
+    Key: fileName,
+    Body: csvContent,
+    ContentType: "text/csv"
+  }));
+
+  console.log(`[EMIT] download_progress - Report: ${reportId}, Tenant: ${tenantId}, Progress: 95%`);
+  socket.emit('download_progress', { reportId, tenantId, progress: 95 });
+  await updateReportProgress(reportId, 'processing', 95);
+
+  const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${fileName}`;
+
+  await pool.query(
+    'UPDATE report_history SET status = $1, link = $2, progress = $3 WHERE id = $4',
+    ['completed', s3Url, 100, reportId]
+  );
+
+  console.log(`[EMIT] report_completed - Report: ${reportId}, Tenant: ${tenantId}, URL: ${s3Url}`);
+  socket.emit('report_completed', { reportId, tenantId, link: s3Url });
+  console.log(`Report ${reportId} processed successfully.`);
+};
+
+export const handler = async (event) => {
+  await connectWithRetry();
+
+  const recordPromises = event.Records.map(async (record) => {
+    try {
+      await processRecord(record);
+    } catch (error) {
+      const { reportId } = JSON.parse(record.body);
+      console.error(`Record failed for report ${reportId}:`, error.message || error);
+      await pool.query(
+        'UPDATE report_history SET status = $1, progress = $2 WHERE id = $3',
+        ['failed', 100, reportId]
+      );
+    }
+  });
+
+  const settled = await Promise.allSettled(recordPromises);
+  const failures = settled.filter(result => result.status === 'rejected');
+  if (failures.length > 0) {
+    console.warn(`${failures.length} record(s) failed, but batch will complete so messages are removed from SQS.`);
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 500));
 };
