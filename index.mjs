@@ -2,7 +2,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { Signer } from "@aws-sdk/rds-signer";
 import pkg from 'pg';
 import { io } from 'socket.io-client';
 
@@ -14,7 +13,7 @@ const s3Client = new S3Client({ region });
 
 // Connect to your backend's Socket.io server
 // You must define BACKEND_SOCKET_URL in your Lambda's environment variables (e.g., https://api.yourdomain.com)
-const socket = io(process.env.BACKEND_SOCKET_URL, {
+const socket = io(process.env.BACKEND_SOCKET_URL || "http://localhost:4000", {
     transports: ['websocket'],
     autoConnect: true
 });
